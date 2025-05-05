@@ -1,0 +1,575 @@
+---
+title: "TMCD Frames from Video (colored)"
+output: html_notebook     
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source("tmcd_functions.R")
+
+library(robustmatrix)  
+library(ggplot2)        
+library(patchwork) 
+library(grid)
+library(gridExtra)
+library(ggtext)
+library(cowplot)
+
+options(scipen = 999)
+```
+
+```{r}
+##  Load the demo colour video ----------------------
+load(url("https://wis.kuleuven.be/stat/robust/Programs/DO/do-video-data-rdata"))
+## 'Video' shape: (n_frame , height , width , 3)
+cat("Video dimensions:", paste(dim(Video), collapse = " x "), "\n")
+```
+```{r}
+############################################################
+# BUILD DATA SETS                                      
+############################################################
+## 1‑A  Grayscale matrix data  (MMCD paradigm) ------------
+video_gray <- apply(Video, c(1, 2, 3), mean)        
+X_mmcd     <- aperm(video_gray, c(2, 3, 1))         
+X_mmcd_200 <- X_mmcd[ , , 1:200, drop = FALSE]      # first 200 frames
+
+## 1‑B  Colour tensor data  (TMCD paradigm) ---------------
+X_tmcd     <- Video                                 
+X_tmcd_200 <- X_tmcd[1:200, , , , drop = FALSE]     # first 200 frames
+
+
+```
+
+
+
+
+
+```{r}
+############################################################
+#  COVARIANCE-MATRIX MLEs (FIRST 200 FRAMES)              
+############################################################
+
+## 2‑A  Matrix normal MLE  (MMCD line) --------------------
+# (do not change this part)
+mmle_time <- system.time(                    
+  mmle_res <- mmle(X_mmcd_200, lambda = 0)   # pure MLE
+)
+
+cat(sprintf("MMLE runtime:  %.2f seconds\n", mmle_time["elapsed"]))
+
+
+## 2‑B  TMLE wrapper  (previously flip‑flop MLE) ----------
+# Critical change: we now call the TMLE() function instead of manually calling flipFlopMLE.
+
+ff_time <- system.time({
+  ff_res <- TMLE(X_tmcd_200, efficient = FALSE, maxIter = 100, tol = 1e-3)
+  invSqrt3_hat <- inverseSquareRootMatrix(ff_res$Sigma3)
+})
+
+cat(sprintf("TMLE runtime: %.2f seconds\n", ff_time["elapsed"]))
+
+```
+
+
+```{r}
+############################################################
+# SQUARED MAHALANOBIS DISTANCES  (ALL FRAMES)          
+############################################################
+
+## 3‑A  Matrix case (MMCD) --------------------------------
+MD2_mmcd <- mmd(
+  X        = X_mmcd,                     # all frames
+  mu       = mmle_res$mu,
+  cov_row  = mmle_res$cov_row_inv,
+  cov_col  = mmle_res$cov_col_inv,
+  inverted = TRUE                        
+)
+
+## 3‑B  Tensor case (TMCD) --------------------------------
+
+MD2_tmcd <- tMD(
+  X                  = X_tmcd,
+  M                  = ff_res$M,         
+  Sigma1             = ff_res$Sigma1,
+  Sigma2             = ff_res$Sigma2,
+  Sigma3             = ff_res$Sigma3,
+  returnContributions = FALSE
+)
+
+
+```
+
+
+
+```{r}
+############################################################
+# Ploting
+############################################################
+############################################################
+# Degrees of freedom and normalisation
+############################################################
+# Matrix (MMCD)
+df_mmcd <- prod(dim(X_mmcd)[1:2])
+
+# Tensor (TMCD)
+df_tmcd <- prod(dim(X_tmcd)[2:4])
+
+# Normalised distances
+MD2_mmcd_norm <- MD2_mmcd / df_mmcd
+MD2_tmcd_norm <- MD2_tmcd / df_tmcd
+
+# 99 % chi2 thresholds (normalised)
+thresh_mmcd <- qchisq(0.99, df_mmcd) / df_mmcd
+thresh_tmcd <- qchisq(0.99, df_tmcd) / df_tmcd
+
+
+############################################################
+# PLOTTING (normalised distances + 99 % thresholds)
+############################################################
+n_frames  <- length(MD2_mmcd_norm)
+tick_step <- 25
+x_axis <- scale_x_continuous(
+  limits = c(1, n_frames),
+  breaks = seq(0, n_frames, by = tick_step),
+  expand = c(0, 0)
+)
+
+############################################################
+# Joint plot with two dashed 99 %-threshold lines
+############################################################
+offset <- 4.5                                   # horizontal shift
+n_frames <- length(MD2_mmcd_norm)
+
+# data frame that holds the two dashed lines
+thr_lines <- data.frame(
+  x_start = c(1,            1 + offset),
+  x_end   = c(n_frames,     n_frames + offset),
+  y       = c(thresh_mmcd,  thresh_tmcd),
+  label   = c("99% threshold (grayscale)",
+              "99% threshold (colour)")
+)
+
+desired_order <- c("MMLE (grayscale)",
+                   "TMLE (colour)",
+                   "99% threshold (grayscale)",
+                   "99% threshold (colour)")
+
+p_joint <- ggplot(
+  rbind(
+    data.frame(Frame = seq_along(MD2_mmcd_norm),
+               MD2   = MD2_mmcd_norm,
+               Method = "MMLE (grayscale)"),
+    data.frame(Frame = seq_along(MD2_tmcd_norm),
+               MD2   = MD2_tmcd_norm,
+               Method = "TMLE (colour)")
+  ),
+  aes(Frame, MD2, colour = Method)
+) +
+  geom_line(linewidth = 0.4) +
+  geom_point(size = 0.7) +
+  # add dashed threshold lines from a single-row data frame
+  geom_segment(
+    data = thr_lines,
+    aes(x = x_start, xend = x_end,
+        y = y,       yend = y,
+        colour = label),
+    linetype = "dashed",
+    linewidth = 0.7,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title  = "Normalised Mahalanobis Distances (grayscale vs. colour)",
+    x      = "Frame index",
+    y      = "Normalised squared Mahalanobis distance",
+    colour = NULL               # remove legend header
+  ) +
+  scale_colour_manual(
+    breaks = desired_order,
+    values = c("MMLE (grayscale)"          = "#1F77B4",
+               "TMLE (colour)"             = "#D62728",
+               "99% threshold (grayscale)" = "#1F77B4",
+               "99% threshold (colour)"    = "#D62728")
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+
+# TMCD-only plot
+plt_tmcd <- ggplot(
+  data.frame(Frame = 1:n_frames, MD2 = MD2_tmcd_norm),
+  aes(Frame, MD2)
+) +
+  geom_line(linewidth = 0.4, colour = "#D62728") +
+  geom_point(size = 0.7, colour = "#D62728") +
+  geom_hline(
+    aes(yintercept = thresh_tmcd, colour = "99% threshold (colour)"),
+    linetype = "dashed", linewidth = 0.7
+  ) +
+  x_axis +
+  labs(
+    title = "Normalised Mahalanobis Distances (TMLE, colour)",
+    x     = "Frame index",
+    y     = "Normalised squared Mahalanobis distance",
+    colour = NULL
+  ) +
+  scale_colour_manual(
+    name   = NULL,
+    values = c("99% threshold (colour)" = "#D62728")
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+
+# Display
+p_joint
+plt_mmcd
+plt_tmcd
+
+
+
+```
+
+```{r}
+#   write a multi‑page PD
+#   page 1 : joint plot
+#   page 2 : MMCD only
+#   page 3 : TMCD only
+pdf("fig_mahalanobis_all.pdf",
+    onefile = TRUE,   
+    family = "Helvetica",                     
+    useDingbats = FALSE)                      
+
+print(p_joint)
+print(plt_mmcd)
+print(plt_tmcd)
+
+dev.off()
+```
+
+
+```{r}
+############################################################
+# Max MD2 frames over several frame ranges                 
+############################################################
+ranges <- list(
+  `1–475` = 1:475,
+  `475–500` = 475:500,
+  `1–200` = 1:200,
+  `200–350` = 200:350
+)
+
+
+max_frame <- function(md2_vector, idx_range) {
+  idx_local_max <- which.max(md2_vector[idx_range])  
+  idx_range[idx_local_max]                            
+}
+
+
+max_mmcd <- sapply(ranges, max_frame, md2_vector = MD2_mmcd)
+max_tmcd <- sapply(ranges, max_frame, md2_vector = MD2_tmcd)
+
+
+for (r in names(ranges)) {
+  cat(sprintf("MMLE  – interval %s: frame %d has the largest MD2\n",
+              r, max_mmcd[[r]]))
+  cat(sprintf("TMLE  – interval %s: frame %d has the largest MD2\n\n",
+              r, max_tmcd[[r]]))
+}
+```
+
+
+
+```{r}
+############################################################
+# Full‑colour snapshots                 
+############################################################
+
+
+frames_to_show <- c(42, 74, 228, 422, 423, 486, 500)
+
+h <- dim(Video)[2]    # image height
+w <- dim(Video)[3]    # image width
+
+build_long_rgb <- function(f) {
+  df <- expand.grid(y = 1:h, x = 1:w)        # y first, x second
+  df$r <- as.vector(Video[f, , , 1] / 255)
+  df$g <- as.vector(Video[f, , , 2] / 255)
+  df$b <- as.vector(Video[f, , , 3] / 255)
+  df$rgb_val <- with(df, rgb(r, g, b))
+  df
+}
+
+
+
+make_frame_plot <- function(img_df, frame_id) {
+  ggplot(img_df, aes(x, y)) +
+    geom_raster(aes(fill = rgb_val)) +
+    scale_fill_identity() +
+    coord_fixed() +
+    
+   
+    annotate(
+      "text",
+      x      = w / 2,              
+      y      = 1,                  
+      label  = paste("Frame", frame_id),
+      vjust  = 1.1,                
+      colour = "white",
+      size   = 6,
+      fontface = "bold"
+    ) +
+
+
+    theme_void() +
+    theme(
+      panel.border = element_rect(colour = "black", fill = NA),
+      plot.title   = element_blank()    
+    ) +
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_reverse(expand = c(0, 0))
+}
+
+plots <- lapply(frames_to_show, function(f) {
+  make_frame_plot(build_long_rgb(f), f)
+})
+
+
+for (p in plots) print(p)
+
+
+
+```
+
+```{r}
+layout_plot <- wrap_plots(
+  plots[order(frames_to_show)],  
+  ncol  = 2,
+  byrow = FALSE                  
+)
+
+
+ggsave(
+  filename = "frames_grid.pdf",
+  plot     = layout_plot,
+  device   = cairo_pdf,          
+
+)
+
+```
+
+
+
+
+
+
+
+```{r}
+set.seed(1234)
+t_tmcd <- system.time(
+  tmcd_res <- tmcd(
+    X                = X_tmcd,
+    alpha            = 0.75,
+    nSubsets         = 10,
+    nBest            = 10,
+    maxIterCshort    = 2,
+    maxIterFFshort   = 2,
+    maxIterCfull     = 20,
+    maxIterFFfull    = 100,
+    tolC             = 1e-4,
+    tolFF            = 1e-3,
+    beta             = 0.9999
+  )
+)
+cat(sprintf("TMCD runtime: %.2f seconds\n", t_tmcd["elapsed"]))
+
+```
+
+```{r}
+cat("Outlier indices:", 
+    paste(tmcd_res$outliers, collapse = ", "), "\n")
+```
+
+
+
+
+
+
+```{r}
+#######################################################################
+# Build grayscale data frame for MMLE plots
+#######################################################################
+build_long_gray <- function(f) {
+  # X_mmcd has dimensions (height, width, frame).
+  # We take the f-th frame, scale to [0,1], and create an RGB with equal channels.
+  h <- dim(X_mmcd)[1]
+  w <- dim(X_mmcd)[2]
+  
+  df <- expand.grid(y = 1:h, x = 1:w)
+  gray_vals <- X_mmcd[ , , f]          # grayscale intensities
+  # If needed, ensure gray_vals is in [0, 255]. Adjust if your data is already 0..1
+  # This example assumes X_mmcd is 0..255
+  df$gray    <- as.vector(gray_vals / 255)
+  df$rgb_val <- with(df, rgb(gray, gray, gray))
+  df
+}
+
+
+#######################################################################
+# 1) Mahalanobis distances: MMLE, TMLE, TMCD --------------------------
+#    (no change for the MMLE part, but switch TMLE/TMCD to 'tMD')
+#######################################################################
+
+## MMLE ---------------------------------------------------------------
+t_mmle_md <- system.time(
+  MD2_mmle <- mmd(
+    X        = X_mmcd,
+    mu       = mmle_res$mu,
+    cov_row  = mmle_res$cov_row,
+    cov_col  = mmle_res$cov_col,
+    inverted = FALSE
+  )
+)["elapsed"]
+
+## TMLE ---------------------------------------------------------------
+
+t_tmle_md <- system.time({
+  MD2_tmle <- tMD(
+    X      = X_tmcd,
+    M      = ff_res$M,
+    Sigma1 = ff_res$Sigma1,
+    Sigma2 = ff_res$Sigma2,
+    Sigma3 = ff_res$Sigma3,
+    returnContributions = FALSE
+  )
+})["elapsed"]
+
+## TMCD ---------------------------------------------------------------
+invSqrt1_tmcd <- inverseSquareRootMatrix(tmcd_res$Sigma1)
+invSqrt2_tmcd <- inverseSquareRootMatrix(tmcd_res$Sigma2)
+invSqrt3_tmcd <- inverseSquareRootMatrix(tmcd_res$Sigma3)
+
+
+t_tmcd_md <- system.time({
+  MD2_tmcd2 <- tMD(
+    X      = X_tmcd,
+    M      = tmcd_res$M,
+    Sigma1 = tmcd_res$Sigma1,
+    Sigma2 = tmcd_res$Sigma2,
+    Sigma3 = tmcd_res$Sigma3,
+    returnContributions = FALSE
+  )
+})["elapsed"]
+
+total_md <- t_mmle_md + t_tmle_md + t_tmcd_md
+cat(sprintf(
+  "MMLE MD2: %.2f s\nTMLE MD2: %.2f s\nTMCD MD2: %.2f s\nTOTAL: %.2f s\n",
+  t_mmle_md, t_tmle_md, t_tmcd_md, total_md
+))
+```
+
+
+```{r}
+#######################################################################
+# 2) Overlay masks: three‑column PDF ----------------------------------
+#    (MMLE frames in grayscale; TMLE/TMCD with 'tMD()')
+#######################################################################
+
+plot_one <- function(img_df, mask) {
+  idx <- which(mask, arr.ind = TRUE)
+  ggplot() +
+    geom_tile(
+      data = img_df, 
+      aes(x, y, fill = rgb_val),
+      width = 1, height = 1, show.legend = FALSE
+    ) +
+    scale_fill_identity() +
+    geom_tile(
+      data = data.frame(x = idx[, 2], y = idx[, 1]),
+      aes(x, y), fill = "red", alpha = .6,
+      width = 1, height = 1, show.legend = FALSE
+    ) +
+    coord_fixed() +
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_reverse(expand = c(0, 0)) +
+    theme_void()
+}
+
+make_overlay_triple <- function(frame, top) {
+  
+  img_df_gray  <- build_long_gray(frame)
+  img_df_color <- build_long_rgb(frame)
+
+  ## MMLE mask ---------------------------------------------------------
+  shv <- matrixShapley(
+    X        = X_mmcd[, , frame, drop = FALSE],
+    mu       = mmle_res$mu,
+    cov_row  = mmle_res$cov_row_inv,
+    cov_col  = mmle_res$cov_col_inv,
+    inverted = TRUE,
+    type     = "cell"
+  )[ , , 1]
+  mask_mmle <- abs(shv) > quantile(abs(shv), 1 - top)
+
+  ## TMLE mask ---------------------------------------------------------
+  
+  res_tMLE <- tMD(
+    X      = array(X_tmcd[frame, , , ], dim = c(1, dim(X_tmcd)[2], dim(X_tmcd)[3], 3)),
+    M      = ff_res$M,
+    Sigma1 = ff_res$Sigma1,
+    Sigma2 = ff_res$Sigma2,
+    Sigma3 = ff_res$Sigma3,
+    returnContributions = TRUE
+  )
+  contrib <- res_tMLE$contributions[1, , , ]  # drop the leading obs dimension
+  mask_tmle <- apply(contrib, c(1, 2), sum) > quantile(apply(contrib, c(1, 2), sum), 1 - top)
+
+  ## TMCD mask ---------------------------------------------------------
+  res_tMCD <- tMD(
+    X      = array(X_tmcd[frame, , , ], dim = c(1, dim(X_tmcd)[2], dim(X_tmcd)[3], 3)),
+    M      = tmcd_res$M,
+    Sigma1 = tmcd_res$Sigma1,
+    Sigma2 = tmcd_res$Sigma2,
+    Sigma3 = tmcd_res$Sigma3,
+    returnContributions = TRUE
+  )
+  contrib2 <- res_tMCD$contributions[1, , , ]
+  mask_tmcd <- apply(contrib2, c(1, 2), sum) > quantile(apply(contrib2, c(1, 2), sum), 1 - top)
+
+  # plot in grayscale for MMLE, color for TMLE/TMCD
+  p1 <- plot_one(img_df_gray,  mask_mmle)
+  p2 <- plot_one(img_df_color, mask_tmle)
+  p3 <- plot_one(img_df_color, mask_tmcd)
+  
+  plot_grid(p1, p2, p3, ncol = 3, align = "hv")
+}
+
+make_composite <- function(top_level, frames = c(487, 491, 495, 500)) {
+  triple  <- lapply(frames, make_overlay_triple, top = top_level)
+  top_txt <- format(round(top_level * 100, 2), trim = TRUE, drop0trailing = TRUE)
+
+  header <- plot_grid(
+    ggdraw() + draw_label("MMLE", fontface = "bold", size = 9, hjust = .5),
+    ggdraw() + draw_label("TMLE", fontface = "bold", size = 9, hjust = .5),
+    ggdraw() + draw_label("TMCD", fontface = "bold", size = 9, hjust = .5),
+    ncol = 3
+  )
+  body  <- plot_grid(plotlist = triple, ncol = 1, align = "hv")
+  title <- ggdraw() + draw_label(
+    sprintf("Top %s%% cells (red)", top_txt),
+    fontface = "bold", size = 10, hjust = .5
+  )
+
+  plot_grid(title, header, body, ncol = 1, rel_heights = c(0.06, 0.06, 1))
+}
+
+levels <- c(0.005, 0.01, 0.04, 0.10)
+
+pdf("overlay_levels_3col.pdf", onefile = TRUE, width = 12, height = 10)
+for (alpha in levels) {
+  print(make_composite(alpha))
+}
+dev.off()
+
+
+```

@@ -1,0 +1,1046 @@
+---
+title: "TMCD Simulations"
+output: html_notebook    
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+source("tmcd_functions.R")
+
+library(clusterGeneration)
+```
+
+
+```{r}
+## --- SYSTEM SUMMARY  ----------------------------------------
+get_wmic_value <- function(cmd) {
+  out <- system(cmd, intern = TRUE, ignore.stderr = TRUE) |>
+    trimws() |> (\(x) x[nzchar(x) & grepl("=", x)])()
+  if (length(out)) sub(".*=", "", out[1]) else NA_character_
+}
+
+cpu   <- get_wmic_value("wmic cpu get Name /value")
+ram_b <- as.numeric(get_wmic_value("wmic computersystem get TotalPhysicalMemory /value"))
+manuf <- get_wmic_value("wmic computersystem get Manufacturer /value")
+model <- get_wmic_value("wmic computersystem get Model /value")
+osver <- get_wmic_value("wmic os get Caption /value")
+
+cat(
+  sprintf("R version     : %s", R.version.string),
+  sprintf("Platform      : %s", R.version$platform),
+  sprintf("OS version    : %s", osver),
+  sprintf("CPU           : %s", cpu),
+  sprintf("Total RAM     : %s", if (is.na(ram_b)) "NA" else sprintf('%.1f GB', ram_b/1e9)),
+  sprintf("Manufacturer  : %s", manuf),
+  sprintf("Model         : %s", model),
+  sep = "\n"
+)
+
+
+```
+
+
+
+
+
+```{r}
+madSE <- function(x) {
+  # Median ± SE(MAD)
+  n     <- length(x)
+  med   <- median(x)
+  mad_x <- median(abs(x - med))
+  se    <- 1.858 * mad_x / sqrt(n)
+  list(median = med, se = se)
+}
+
+reportMAD <- function(x, digits = 3) {
+  # Returns a string with median ± SE(MAD)
+  st <- madSE(x)
+  sprintf("%.*f ± %.*f", digits, st$median, digits, st$se)
+}
+
+outlierSummary <- function(actualIndices, flaggedIndices) {
+  # Computes outlier detection metrics
+  n_flagged <- length(flaggedIndices)
+  n_correct <- length(intersect(actualIndices, flaggedIndices))
+  n_actual  <- length(actualIndices)
+  
+  if (n_flagged == 0) {
+    precision <- 0
+  } else {
+    precision <- n_correct / n_flagged
+  }
+  if (n_actual == 0) {
+    recall <- 1
+  } else {
+    recall <- n_correct / n_actual
+  }
+  if (precision + recall == 0) {
+    fscore <- 0
+  } else {
+    fscore <- 2 * (precision * recall) / (precision + recall)
+  }
+  
+  list(
+    n_actual   = n_actual,
+    n_flagged  = n_flagged,
+    n_correct  = n_correct,
+    precision  = precision,
+    recall     = recall,
+    fscore     = fscore
+  )
+}
+
+reportPerformance <- function(
+  titleText,
+  # Vectors of numeric metrics
+  timeVec,          # or NULL for no time
+  muDiffVec,
+  s1DiffVec,
+  s2DiffVec,
+  s3DiffVec,
+  klVec,
+  actualCountVec,
+  flaggedCountVec,
+  correctCountVec,
+  precisionVec,
+  recallVec,
+  fscoreVec
+) {
+  cat("\n====================================\n")
+  cat(titleText, "\n")
+  
+  if (!is.null(timeVec)) {
+    cat("Elapsed time (sec):          ",
+        reportMAD(timeVec, digits=3), "\n")
+  }
+  
+  cat("Mu diff norm:                ",
+      reportMAD(muDiffVec, digits=3), "\n")
+  cat("Sigma1 diff norm:            ",
+      reportMAD(s1DiffVec, digits=3), "\n")
+  cat("Sigma2 diff norm:            ",
+      reportMAD(s2DiffVec, digits=3), "\n")
+  cat("Sigma3 diff norm:            ",
+      reportMAD(s3DiffVec, digits=3), "\n")
+  cat("KL divergence:               ",
+      reportMAD(klVec, digits=3), "\n")
+  
+  cat("Actual number of outliers:   ",
+      reportMAD(actualCountVec, digits=1), "\n")
+  cat("Flagged as outliers:         ",
+      reportMAD(flaggedCountVec, digits=1), "\n")
+  cat("Correctly flagged:           ",
+      reportMAD(correctCountVec, digits=1), "\n")
+  
+  cat("Precision:                   ",
+      reportMAD(precisionVec, digits=3), "\n")
+  cat("Recall:                      ",
+      reportMAD(recallVec, digits=3), "\n")
+  cat("F-score:                     ",
+      reportMAD(fscoreVec, digits=3), "\n")
+  
+  cat("====================================\n\n")
+}
+
+
+#===============================================================================
+# Main function
+#===============================================================================
+run_tmcd_check <- function(
+  #--- Required inputs for data generation ---
+  n,                 # number of observations
+  p1, p2, p3,        # tensor dimensions
+  outlier_fraction,
+  method_outliers,   # either "method1" or "method2"
+  #--- Optional inputs (used only if method2 is chosen) ---
+  infection_fraction = NULL,
+  infection_range    = NULL,
+  #--- Optional inputs (used only if method1 is chosen) ---
+  outlier_shift      = NULL,
+  #--- TMCD parameters ---
+  alpha,
+  nSubsets,
+  nBest,
+  maxIterCshort,
+  maxIterFFshort,
+  maxIterCfull,
+  maxIterFFfull,
+  tolC,
+  tolFF,
+  beta,
+  #--- Number of replicates ---
+  nRep = 1
+) {
+  
+  # Initialize storage
+  elapsed_all          <- numeric(nRep)
+  Mu_diff_norm_all     <- numeric(nRep)
+  Sigma1_diff_norm_all <- numeric(nRep)
+  Sigma2_diff_norm_all <- numeric(nRep)
+  Sigma3_diff_norm_all <- numeric(nRep)
+  KL_all               <- numeric(nRep)
+  
+  actual_count_all     <- numeric(nRep)
+  flagged_count_all    <- numeric(nRep)
+  correct_flagged_all  <- numeric(nRep)
+  precision_all        <- numeric(nRep)
+  recall_all           <- numeric(nRep)
+  F_score_all          <- numeric(nRep)
+  
+  # Naive MLE approach
+  Mu_diff_norm_all_mle     <- numeric(nRep)
+  Sigma1_diff_norm_all_mle <- numeric(nRep)
+  Sigma2_diff_norm_all_mle <- numeric(nRep)
+  Sigma3_diff_norm_all_mle <- numeric(nRep)
+  KL_all_mle               <- numeric(nRep)
+  
+  actual_count_all_mle     <- numeric(nRep)
+  flagged_count_all_mle    <- numeric(nRep)
+  correct_flagged_all_mle  <- numeric(nRep)
+  precision_all_mle        <- numeric(nRep)
+  recall_all_mle           <- numeric(nRep)
+  F_score_all_mle          <- numeric(nRep)
+  
+  # Replicates
+  for (rep_idx in seq_len(nRep)) {
+    # Generate covariance and mean
+    covs <- generateCovMatrices(p1, p2, p3, c(0.1, 1), "onion")
+    Sigma1_true <- covs$Sigma1
+    Sigma2_true <- covs$Sigma2
+    Sigma3_true <- covs$Sigma3
+
+    Mu_true <- array(rnorm(p1 * p2 * p3, mean = 1, sd = 1), dim = c(p1, p2, p3))
+    X_clean <- rTensorNorm(n, M = Mu_true, Sigma1_true, Sigma2_true, Sigma3_true)
+    
+    # Possibly contaminate
+    X_outliers      <- X_clean
+    n_outliers      <- floor(n * outlier_fraction)
+    outlier_indices <- numeric(0)
+    
+    if (n_outliers > 0) {
+      outlier_indices <- sample(seq_len(n), n_outliers)
+      
+      if (method_outliers == "method1") {
+        Mu_shifted <- Mu_true + outlier_shift
+        X_outlier_sample <- rTensorNorm(n_outliers, Mu_shifted,
+                                        Sigma1_true, Sigma2_true, Sigma3_true)
+        for (i in seq_len(n_outliers)) {
+          X_outliers[outlier_indices[i], , , ] <- X_outlier_sample[i, , , ]
+        }
+        
+      } else if (method_outliers == "method2") {
+        if (is.null(infection_fraction) || is.null(infection_range)) {
+          stop("For method2, provide infection_fraction and infection_range.")
+        }
+        total_cells <- p1 * p2 * p3
+        cells_to_infect_count <- floor(infection_fraction * total_cells)
+        for (idx in outlier_indices) {
+          infected_cells <- sample.int(total_cells, cells_to_infect_count)
+          coords <- arrayInd(infected_cells, .dim = c(p1, p2, p3))
+          slice  <- X_outliers[idx, , , ]
+          noise  <- runif(cells_to_infect_count,
+                          min = infection_range[1], max = infection_range[2])
+          slice[coords] <- slice[coords] + noise
+          X_outliers[idx, , , ] <- slice
+        }
+      } else {
+        stop("Unknown method_outliers. Must be 'method1' or 'method2'.")
+      }
+    }
+    
+    # TMCD
+    timing_info <- system.time({
+      tmcd_result <- tmcd(
+        X_outliers,
+        alpha          = alpha,
+        nSubsets       = nSubsets,
+        nBest          = nBest,
+        maxIterCshort  = maxIterCshort,
+        maxIterFFshort = maxIterFFshort,
+        maxIterCfull   = maxIterCfull,
+        maxIterFFfull  = maxIterFFfull,
+        tolC           = tolC,
+        tolFF          = tolFF,
+        beta           = beta
+      )
+    })
+    elapsed_all[rep_idx] <- timing_info["elapsed"]
+    
+    # Scale
+    s1_true <- Sigma1_true[1, 1]
+    s2_true <- Sigma2_true[1, 1]
+    Sigma1_true_scaled <- Sigma1_true / s1_true
+    Sigma2_true_scaled <- Sigma2_true / s2_true
+    Sigma3_true_scaled <- Sigma3_true * (s1_true * s2_true)
+    
+    # Differences
+    Mu_diff <- tmcd_result$M - Mu_true
+    Mu_diff_norm_all[rep_idx] <- sqrt(sum(Mu_diff^2, na.rm = TRUE))
+    
+    Sigma1_diff <- tmcd_result$Sigma1 - Sigma1_true_scaled
+    Sigma2_diff <- tmcd_result$Sigma2 - Sigma2_true_scaled
+    Sigma3_diff <- tmcd_result$Sigma3 - Sigma3_true_scaled
+    
+    Sigma1_diff_norm_all[rep_idx] <- sqrt(sum(Sigma1_diff^2))
+    Sigma2_diff_norm_all[rep_idx] <- sqrt(sum(Sigma2_diff^2))
+    Sigma3_diff_norm_all[rep_idx] <- sqrt(sum(Sigma3_diff^2))
+    
+    KL_all[rep_idx] <- KL(
+      Sigma1_true_scaled,
+      Sigma2_true_scaled,
+      Sigma3_true_scaled,
+      tmcd_result$Sigma1,
+      tmcd_result$Sigma2,
+      tmcd_result$Sigma3
+    )
+    
+    # Outlier detection (TMCD)
+    tmcd_out <- outlierSummary(outlier_indices, tmcd_result$outliers)
+    actual_count_all[rep_idx]    <- tmcd_out$n_actual
+    flagged_count_all[rep_idx]   <- tmcd_out$n_flagged
+    correct_flagged_all[rep_idx] <- tmcd_out$n_correct
+    precision_all[rep_idx]       <- tmcd_out$precision
+    recall_all[rep_idx]          <- tmcd_out$recall
+    F_score_all[rep_idx]         <- tmcd_out$fscore
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    #sig_res <- list(
+        #Sigma1_true_scaled = Sigma1_true_scaled,
+        #Sigma2_true_scaled = Sigma2_true_scaled,
+        #Sigma3_true_scaled = Sigma3_true_scaled,
+        #Sigma1_est         = tmcd_result$Sigma1,
+        #Sigma2_est         = tmcd_result$Sigma2,
+        #Sigma3_est         = tmcd_result$Sigma3
+      #)
+      #compareSigmas(sig_res, digits = 3, col_gap = 6)
+    
+    
+    
+    # Naive MLE approach
+    MLE1_result <- TMLE(X_outliers,
+                        efficient = FALSE,
+                        maxIter   = maxIterFFfull,
+                        tol       = tolFF)
+    
+    dist_mle1   <- tMD(X_outliers,
+                       MLE1_result$M,
+                       MLE1_result$Sigma1,
+                       MLE1_result$Sigma2,
+                       MLE1_result$Sigma3)
+    
+    chi_thresh  <- qchisq(0.975, df = p1 * p2 * p3)
+    flagged_outliers_mle <- which(dist_mle1 > chi_thresh)
+    
+    X_pruned    <- X_outliers[-flagged_outliers_mle, , , , drop = FALSE]
+    MLE2_result <- TMLE(X_pruned,
+                        efficient = FALSE,
+                        maxIter   = maxIterFFfull,
+                        tol       = tolFF)
+    
+    # Compare final estimates
+    Mu_diff_mle <- MLE2_result$M - Mu_true
+    Mu_diff_norm_all_mle[rep_idx] <- sqrt(sum(Mu_diff_mle^2, na.rm = TRUE))
+    
+    Sigma1_diff_mle <- MLE2_result$Sigma1 - Sigma1_true_scaled
+    Sigma2_diff_mle <- MLE2_result$Sigma2 - Sigma2_true_scaled
+    Sigma3_diff_mle <- MLE2_result$Sigma3 - Sigma3_true_scaled
+    
+    Sigma1_diff_norm_all_mle[rep_idx] <- sqrt(sum(Sigma1_diff_mle^2))
+    Sigma2_diff_norm_all_mle[rep_idx] <- sqrt(sum(Sigma2_diff_mle^2))
+    Sigma3_diff_norm_all_mle[rep_idx] <- sqrt(sum(Sigma3_diff_mle^2))
+    
+    KL_all_mle[rep_idx] <- KL(
+      Sigma1_true_scaled,
+      Sigma2_true_scaled,
+      Sigma3_true_scaled,
+      MLE2_result$Sigma1,
+      MLE2_result$Sigma2,
+      MLE2_result$Sigma3
+    )
+    
+    # Outlier detection (MLE)
+    mle_out <- outlierSummary(outlier_indices, flagged_outliers_mle)
+    actual_count_all_mle[rep_idx]    <- mle_out$n_actual
+    flagged_count_all_mle[rep_idx]   <- mle_out$n_flagged
+    correct_flagged_all_mle[rep_idx] <- mle_out$n_correct
+    precision_all_mle[rep_idx]       <- mle_out$precision
+    recall_all_mle[rep_idx]          <- mle_out$recall
+    F_score_all_mle[rep_idx]         <- mle_out$fscore
+  }
+  
+  # Report TMCD
+  reportPerformance(
+    titleText       = sprintf("TMCD Performance (%d replicates):", nRep),
+    timeVec         = elapsed_all,
+    muDiffVec       = Mu_diff_norm_all,
+    s1DiffVec       = Sigma1_diff_norm_all,
+    s2DiffVec       = Sigma2_diff_norm_all,
+    s3DiffVec       = Sigma3_diff_norm_all,
+    klVec           = KL_all,
+    actualCountVec  = actual_count_all,
+    flaggedCountVec = flagged_count_all,
+    correctCountVec = correct_flagged_all,
+    precisionVec    = precision_all,
+    recallVec       = recall_all,
+    fscoreVec       = F_score_all
+  )
+  
+  # Report naive MLE
+  reportPerformance(
+    titleText       = sprintf("Naive MLE Approach (%d replicates):", nRep),
+    timeVec         = NULL,  # no time measurement
+    muDiffVec       = Mu_diff_norm_all_mle,
+    s1DiffVec       = Sigma1_diff_norm_all_mle,
+    s2DiffVec       = Sigma2_diff_norm_all_mle,
+    s3DiffVec       = Sigma3_diff_norm_all_mle,
+    klVec           = KL_all_mle,
+    actualCountVec  = actual_count_all_mle,
+    flaggedCountVec = flagged_count_all_mle,
+    correctCountVec = correct_flagged_all_mle,
+    precisionVec    = precision_all_mle,
+    recallVec       = recall_all_mle,
+    fscoreVec       = F_score_all_mle
+  )
+  
+  invisible(list(
+    # TMCD
+    Mu_diff_norm_all     = Mu_diff_norm_all,
+    Sigma1_diff_norm_all = Sigma1_diff_norm_all,
+    Sigma2_diff_norm_all = Sigma2_diff_norm_all,
+    Sigma3_diff_norm_all = Sigma3_diff_norm_all,
+    KL_all               = KL_all,
+    actual_count_all     = actual_count_all,
+    flagged_count_all    = flagged_count_all,
+    correct_flagged_all  = correct_flagged_all,
+    precision_all        = precision_all,
+    recall_all           = recall_all,
+    F_score_all          = F_score_all,
+    time_all             = elapsed_all,
+    
+    # MLE
+    Mu_diff_norm_all_mle     = Mu_diff_norm_all_mle,
+    Sigma1_diff_norm_all_mle = Sigma1_diff_norm_all_mle,
+    Sigma2_diff_norm_all_mle = Sigma2_diff_norm_all_mle,
+    Sigma3_diff_norm_all_mle = Sigma3_diff_norm_all_mle,
+    KL_all_mle               = KL_all_mle,
+    actual_count_all_mle     = actual_count_all_mle,
+    flagged_count_all_mle    = flagged_count_all_mle,
+    correct_flagged_all_mle  = correct_flagged_all_mle,
+    precision_all_mle        = precision_all_mle,
+    recall_all_mle           = recall_all_mle,
+    F_score_all_mle          = F_score_all_mle
+  ))
+}
+
+
+```
+
+
+
+```{r}
+#===============================================================================
+# Example 1.1
+#===============================================================================
+seed <- 104
+
+my_params <- list(
+  n = 100,
+  p1 = 5,
+  p2 = 4,
+  p3 = 3,
+  outlier_shift = 2,
+  outlier_fraction = 0.25,
+  method_outliers = "method1",  
+  alpha = 0.6,
+  nSubsets = 500,
+  nBest = 10,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=30
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+
+
+```{r}
+#===============================================================================
+# Example 1.2
+#===============================================================================
+seed <- 101
+
+my_params <- list(
+  n = 100,
+  p1 = 5,
+  p2 = 4,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.25,
+  method_outliers = "method1",  
+  alpha = 0.6,
+  nSubsets = 500,
+  nBest = 10,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=100
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+```
+```{r}
+#===============================================================================
+# Example 1.3
+#===============================================================================
+seed <- 101
+
+my_params <- list(
+  n = 100,
+  p1 = 5,
+  p2 = 4,
+  p3 = 3,
+  outlier_shift = 0.001,
+  outlier_fraction = 0.25,
+  method_outliers = "method1",  
+  alpha = 0.6,
+  nSubsets = 500,
+  nBest = 10,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=30
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+```
+
+```{r}
+#===============================================================================
+# Example 1.4
+#===============================================================================
+seed <- 105
+
+my_params <- list(
+  n = 8,
+  p1 = 5,
+  p2 = 4,
+  p3 = 3,
+  outlier_shift = 5,
+  outlier_fraction = 0.25,
+  method_outliers = "method1",
+  alpha = 0.6,
+  nSubsets = 500,
+  nBest = 10,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=1
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+```
+
+
+```{r}
+#===============================================================================
+# Example 1.5
+#===============================================================================
+seed <- 105
+
+my_params <- list(
+  n = 8,
+  p1 = 5,
+  p2 = 4,
+  p3 = 3,
+  outlier_shift = 5,
+  outlier_fraction = 0.25,
+  method_outliers = "method1",
+  alpha = 0.6,
+  nSubsets = 10,
+  nBest = 1,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99999999999999,
+  nRep=1
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+```
+
+
+
+```{r}
+#===============================================================================
+# Example 2.1
+#===============================================================================
+seed <- 102
+
+my_params <- list(
+  n = 100,
+  p1 = 10,
+  p2 = 20,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.2,
+  method_outliers = "method1",  
+  alpha = 0.7,
+  nSubsets = 500,
+  nBest = 10,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=10
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+
+
+
+
+```{r}
+#===============================================================================
+# Example 2.2
+#===============================================================================
+seed <- 102
+
+my_params <- list(
+  n = 1000,
+  p1 = 10,
+  p2 = 20,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.2,
+  method_outliers = "method1",  
+  alpha = 0.7,
+  nSubsets = 500,
+  nBest = 10,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=3
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+
+
+```{r}
+#===============================================================================
+# Example 2.3
+#===============================================================================
+seed <- 102
+
+my_params <- list(
+  n = 1000,
+  p1 = 10,
+  p2 = 20,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.2,
+  method_outliers = "method1",  
+  alpha = 0.7,
+  nSubsets = 5,
+  nBest = 2,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=100
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+
+
+```{r}
+#===============================================================================
+# Example 2.4
+#===============================================================================
+seed <- 104
+
+my_params <- list(
+  n = 1000,
+  p1 = 10,
+  p2 = 20,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.499,
+  method_outliers = "method1",  
+  alpha = 0.501,
+  nSubsets = 5,
+  nBest = 2,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=30
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+
+```{r}
+#===============================================================================
+# Example 2.5
+#===============================================================================
+seed <- 106
+
+my_params <- list(
+  n = 1000,
+  p1 = 10,
+  p2 = 20,
+  p3 = 3,
+  outlier_shift = 2,
+  outlier_fraction = 0.499,
+  method_outliers = "method1",  
+  alpha = 0.501,
+  nSubsets = 20,
+  nBest = 1,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=30
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+
+```{r}
+#===============================================================================
+# Example 3.1
+#===============================================================================
+seed <- 103
+
+my_params <- list(
+  n = 1000,
+  p1 = 30,
+  p2 = 40,
+  p3 = 50,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.499,
+  method_outliers = "method1",  
+  alpha = 0.501,
+  nSubsets = 5,
+  nBest = 2,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=3
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+
+```{r}
+#===============================================================================
+# Example 3.2
+#===============================================================================
+seed <- 104
+
+my_params <- list(
+  n = 7,
+  p1 = 30,
+  p2 = 40,
+  p3 = 50,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.499,
+  method_outliers = "method1",
+  alpha = 0.6,
+  nSubsets = 40,
+  nBest = 1,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=3
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+
+```{r}
+#===============================================================================
+# Example 4.1
+#===============================================================================
+seed <- 104
+
+my_params <- list(
+  n = 500,
+  p1 = 20,
+  p2 = 5,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.1,
+  method_outliers = "method1",
+  alpha = 0.6,
+  nSubsets = 20,
+  nBest = 2,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=30
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+```
+
+
+
+
+```{r}
+#===============================================================================
+# Example 4.2
+#===============================================================================
+seed <- 104
+
+my_params <- list(
+  n = 500,
+  p1 = 20,
+  p2 = 5,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.05,
+  method_outliers = "method1",
+  alpha = 0.6,
+  nSubsets = 20,
+  nBest = 2,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=30
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+```
+
+
+
+```{r}
+#===============================================================================
+# Example 4.3
+#===============================================================================
+seed <- 104
+
+my_params <- list(
+  n = 500,
+  p1 = 20,
+  p2 = 5,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.01,
+  method_outliers = "method1",
+  alpha = 0.6,
+  nSubsets = 20,
+  nBest = 2,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.99,
+  nRep=30
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+```
+
+```{r}
+#===============================================================================
+# Example 4.4
+#===============================================================================
+seed <- 104
+
+my_params <- list(
+  n = 500,
+  p1 = 20,
+  p2 = 5,
+  p3 = 3,
+  outlier_shift = 0.5,
+  outlier_fraction = 0.01,
+  method_outliers = "method1",
+  alpha = 0.6,
+  nSubsets = 20,
+  nBest = 2,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.9999,
+  nRep=30
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+```
+
+```{r}
+#===============================================================================
+# Example 5
+#===============================================================================
+seed <- 105
+
+my_params <- list(
+  n = 1000,
+  p1 = 20,
+  p2 = 30,
+  p3 = 5,
+  outlier_fraction = 0.01,
+  method_outliers = "method2",
+  infection_fraction = 0.01,       
+  infection_range    = c(0.3, 0.7),   
+  alpha = 0.6,
+  nSubsets = 10,
+  nBest = 2,
+  maxIterCshort = 2,
+  maxIterFFshort = 2,
+  maxIterCfull = 100,
+  maxIterFFfull = 100,
+  tolC = 1e-4,
+  tolFF = 1e-3,
+  beta = 0.9999,
+  nRep=10
+)
+
+# Set the seed for reproducibility
+set.seed(seed)
+
+res <- do.call(run_tmcd_check, my_params)
+
+
+```
+

@@ -1,0 +1,133 @@
+---
+title: "T_generation_comparison"
+output: html_notebook  
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source("tmcd_functions.R")
+
+library(clusterGeneration)
+library(Tlasso)
+```
+
+```{r}
+## --- SYSTEM SUMMARY  ----------------------------------------
+get_wmic_value <- function(cmd) {
+  out <- system(cmd, intern = TRUE, ignore.stderr = TRUE) |>
+    trimws() |> (\(x) x[nzchar(x) & grepl("=", x)])()
+  if (length(out)) sub(".*=", "", out[1]) else NA_character_
+}
+
+cpu   <- get_wmic_value("wmic cpu get Name /value")
+ram_b <- as.numeric(get_wmic_value("wmic computersystem get TotalPhysicalMemory /value"))
+manuf <- get_wmic_value("wmic computersystem get Manufacturer /value")
+model <- get_wmic_value("wmic computersystem get Model /value")
+osver <- get_wmic_value("wmic os get Caption /value")
+
+cat(
+  sprintf("R version     : %s", R.version.string),
+  sprintf("Platform      : %s", R.version$platform),
+  sprintf("OS version    : %s", osver),
+  sprintf("CPU           : %s", cpu),
+  sprintf("Total RAM     : %s", if (is.na(ram_b)) "NA" else sprintf('%.1f GB', ram_b/1e9)),
+  sprintf("Manufacturer  : %s", manuf),
+  sprintf("Model         : %s", model),
+  sep = "\n"
+)
+
+
+```
+
+
+
+```{r}
+# ---------------------------------------------------------------------------
+# Benchmark data-generation speed with fresh covariance matrices each run
+# ---------------------------------------------------------------------------
+benchmarkGenerators <- function(n, p1, p2, p3,
+                                nTests    = 100L,
+                                rangeVar  = c(0.1, 1),
+                                covMethod = "onion") {
+
+  times_ours   <- numeric(nTests)
+  times_tlasso <- numeric(nTests)
+
+  for (i in seq_len(nTests)) {
+
+    covs <- generateCovMatrices(p1, p2, p3, rangeVar, covMethod)
+    Sigma1 <- covs$Sigma1
+    Sigma2 <- covs$Sigma2
+    Sigma3 <- covs$Sigma3
+
+    Mu_true <- array(rnorm(p1 * p2 * p3, 1, 1), dim = c(p1, p2, p3))
+
+    times_ours[i] <- system.time(
+      rTensorNorm(n, Mu_true, Sigma1, Sigma2, Sigma3)
+    )[["elapsed"]]
+
+    times_tlasso[i] <- tryCatch(
+      system.time(
+        Tlasso::Trnorm(n          = n,
+                       m.vec      = c(p1, p2, p3),
+                       mu         = Mu_true,
+                       Sigma.list = list(Sigma1, Sigma2, Sigma3))
+      )[["elapsed"]],
+      error = function(e) NA_real_
+    )
+  }
+
+  med1 <- median(times_ours)
+  mad1 <- median(abs(times_ours - med1))
+  se1  <- 1.858 * mad1 / sqrt(nTests)          
+  
+  med2 <- median(times_tlasso, na.rm = TRUE)
+  mad2 <- median(abs(times_tlasso - med2), na.rm = TRUE)
+  n2   <- sum(!is.na(times_tlasso))            
+  se2  <- 1.858 * mad2 / sqrt(n2)              
+
+  # avoid divide-by-zero
+  factor <- if (is.finite(med2))
+              med2 / max(med1, .Machine$double.eps) else NA_real_
+
+  out1 <- sprintf("ours   : %.3f \u00B1 %.3f sec",  med1, se1)
+  out2 <- if (is.finite(med2))
+            sprintf("tlasso : %.3f \u00B1 %.3f sec", med2, se2)
+          else
+            "tlasso : NA"
+
+  out3 <- if (is.finite(factor))
+            sprintf("speedup (median): %.2f\u00D7", factor)
+          else
+            "speedup (median): NA"
+
+  c(out1, out2, out3)
+}
+
+```
+
+
+
+
+```{r}
+set.seed(123)
+
+tests <- list(
+  list(n = 100,  p1 = 5,  p2 = 4,  p3 = 3,  nTests = 100),
+  list(n = 100,  p1 = 10, p2 = 20, p3 = 3,  nTests = 100),
+  list(n = 1000, p1 = 10, p2 = 20, p3 = 3,  nTests = 10),
+  list(n = 300,  p1 = 20,  p2 = 15,  p3 = 10,  nTests = 10),
+  list(n = 1000, p1 = 30, p2 = 40, p3 = 50, nTests = 3)
+)
+
+for (k in seq_along(tests)) {
+  p <- tests[[k]]
+  cat(sprintf(
+    "\nCase %d (n=%d, p1=%d, p2=%d, p3=%d, nTests=%d)\n",
+    k, p$n, p$p1, p$p2, p$p3, p$nTests))
+  cat(benchmarkGenerators(p$n, p$p1, p$p2, p$p3, p$nTests), sep = "\n")
+  cat("\n")
+}
+
+```
