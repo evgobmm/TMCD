@@ -9,3 +9,4 @@ The following detection strategies are briefly considered:
 3. **Mahalanobis Distance** – modelling the distribution of video clips with covariance estimators (e.g. the robust TMCD algorithm). Outliers can be spotted by thresholding the squared Mahalanobis distance.
 
 The supplied notebook demonstrates how to time the Mahalanobis-based approach and serves as a template for comparing against deep-learning baselines.
+
