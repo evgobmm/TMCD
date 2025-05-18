@@ -10,6 +10,7 @@ The following detection strategies are briefly considered:
 
 The supplied notebook demonstrates how to time the Mahalanobis-based approach and serves as a template for comparing against deep-learning baselines.
 
+
 ## Running in Colab
 
 1. Clone this repo in Colab:
@@ -19,3 +20,4 @@ The supplied notebook demonstrates how to time the Mahalanobis-based approach an
 ```
 2. Upload `tensor_dataset_sea.zip` to `/content` (see the dataset link in the main README).
 3. Open `mahalanobis_benchmark.ipynb` and run all cells on a GPU runtime.
+
